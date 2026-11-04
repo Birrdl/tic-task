@@ -1,6 +1,7 @@
 package com.example.mylist
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -253,6 +254,7 @@ fun cancelNotification(context: Context, listName: String, itemText: String) {
 }
 
 class NotifWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+    @SuppressLint("MissingPermission")
     override fun doWork(): Result {
         val text = inputData.getString("text") ?: return Result.success()
         val list = inputData.getString("list") ?: ""
@@ -482,11 +484,7 @@ fun App(
             }
         }
         val filter = IntentFilter("com.example.mylist.ITEM_DONE")
-        if (Build.VERSION.SDK_INT >= 33) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            context.registerReceiver(receiver, filter)
-        }
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         onDispose { context.unregisterReceiver(receiver) }
     }
 
