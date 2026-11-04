@@ -308,7 +308,7 @@ class NotifWorker(context: Context, params: WorkerParameters) : Worker(context, 
             .addAction(0, "Redéfinir échéance", remindPi)
             .setAutoCancel(true)
             .build()
-        NotificationManagerCompat.from(ctx).notify(text.hashCode(), notif)
+        NotificationManagerCompat.from(ctx).notify((list + text).hashCode(), notif)
         return Result.success()
     }
 }
@@ -327,7 +327,7 @@ class MarkDoneReceiver : BroadcastReceiver() {
             target.items[idx] = target.items[idx].copy(checked = true)
             cancelNotification(context, listName, itemText)
             // Retire la notification affichée
-            NotificationManagerCompat.from(context).cancel(itemText.hashCode())
+            NotificationManagerCompat.from(context).cancel((listName + itemText).hashCode())
             store.save(lists)
             // Prévient l'app si elle est ouverte, pour rafraîchir l'affichage
             // immédiatement (sinon l'état en mémoire écraserait la coche)
@@ -431,7 +431,7 @@ class MainActivity : ComponentActivity() {
         val item = intent.getStringExtra("editItem") ?: return
         val openDialog = intent.getBooleanExtra("openDialog", false)
         // Retire la notification cliquée
-        NotificationManagerCompat.from(this).cancel(item.hashCode())
+        NotificationManagerCompat.from(this).cancel((list + item).hashCode())
         pendingEdit.value = Triple(list, item, openDialog)
     }
 }
