@@ -930,9 +930,9 @@ fun HomeScreen(
             title = { Text("tic-task") },
             text = {
                 Column {
-                    Text("Version beta 1.1", style = MaterialTheme.typography.titleMedium)
+                    Text("tic-task 1.0 — 4 novembre 2026", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("Date de sortie : 3 novembre 2026")
+                    Text("Date de sortie : 4 novembre 2026")
                     Text(
                         "Application de listes de tâches 100 % locale : " +
                                 "aucune donnée ne quitte votre téléphone.",
