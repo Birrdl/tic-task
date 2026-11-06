@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -308,7 +309,7 @@ class NotifWorker(context: Context, params: WorkerParameters) : Worker(context, 
             .setContentIntent(openPi)
             .addAction(0, "Marquer comme fait", markPi)
             .addAction(0, "Redéfinir échéance", remindPi)
-            .setAutoCancel(true)
+            .setAutoCancel(false)
             .build()
         NotificationManagerCompat.from(ctx).notify((list + text).hashCode(), notif)
         return Result.success()
@@ -414,6 +415,12 @@ class MainActivity : ComponentActivity() {
                 primaryContainer = Color(0xFFFFD9DE),
                 onPrimaryContainer = Color(0xFF3F0019)
             )
+            // Icônes de la barre de statut (heure, batterie) : noires en thème
+            // clair, blanches en thème sombre
+            LaunchedEffect(dark) {
+                WindowCompat.getInsetsController(window, window.decorView)
+                    .isAppearanceLightStatusBars = !dark
+            }
             MaterialTheme(colorScheme = colors) {
                 App(store, pendingEdit, themeMode) { mode ->
                     themeMode.value = mode
@@ -432,8 +439,10 @@ class MainActivity : ComponentActivity() {
         val list = intent?.getStringExtra("editList") ?: return
         val item = intent.getStringExtra("editItem") ?: return
         val openDialog = intent.getBooleanExtra("openDialog", false)
-        // Retire la notification cliquée
-        NotificationManagerCompat.from(this).cancel((list + item).hashCode())
+        // « Redéfinir l'échéance » efface la notification ; un simple tap la laisse
+        if (openDialog) {
+            NotificationManagerCompat.from(this).cancel((list + item).hashCode())
+        }
         pendingEdit.value = Triple(list, item, openDialog)
     }
 }
@@ -928,9 +937,9 @@ fun HomeScreen(
             title = { Text("tic-task") },
             text = {
                 Column {
-                    Text("tic-task 1.0 — 4 novembre 2026", style = MaterialTheme.typography.titleMedium)
+                    Text("tic-task 1.0.1 — 6 novembre 2026", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("Date de sortie : 4 novembre 2026")
+                    Text("Date de sortie : 6 novembre 2026")
                     Text(
                         "Application de listes de tâches 100 % locale : " +
                                 "aucune donnée ne quitte votre téléphone.",
@@ -1379,7 +1388,11 @@ fun EntryDialog(
                         checked = hasDue,
                         onCheckedChange = { checked ->
                             hasDue = checked
-                            if (checked && due == null) due = defaultDueToday()
+                            if (checked) {
+                                if (due == null) due = defaultDueToday()
+                                // Notification activée par défaut avec l'échéance
+                                hasNotif = true
+                            }
                             if (!checked) { due = null; hasNotif = false }
                         }
                     )
