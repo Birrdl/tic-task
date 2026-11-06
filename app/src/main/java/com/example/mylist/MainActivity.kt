@@ -18,6 +18,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -25,25 +26,39 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -63,7 +78,21 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
-import kotlin.math.abs
+
+// ---------- Langue : l'interface suit le système (français ou anglais) ----------
+
+val EN = Locale.getDefault().language != "fr"
+fun t(fr: String, en: String) = if (EN) en else fr
+
+// Page GitHub de signalement de bug (remplace TON_PSEUDO et myList par ton dépôt)
+const val GITHUB_ISSUES_URL = "https://github.com/Birrdl/tic-task/issues/new"
+
+// Formate un délai en minutes vers « X j », « X h » ou « X min »
+fun formatLead(minutes: Int): String = when {
+    minutes >= 1440 && minutes % 1440 == 0 -> "${minutes / 1440} ${t("j", "d")}"
+    minutes >= 60 && minutes % 60 == 0 -> "${minutes / 60} h"
+    else -> "$minutes ${t("min", "min")}"
+}
 
 // ---------- Données ----------
 
@@ -73,7 +102,8 @@ data class TaskItem(
     val due: Long? = null,
     val notif: Boolean = false,
     val notifLead: Int = 15,
-    val addedAt: Long = 0L
+    val addedAt: Long = 0L,
+    val desc: String = ""
 )
 
 data class TaskList(
@@ -102,6 +132,12 @@ class LocalStore(private val context: Context) {
         prefs.edit().putInt("theme", mode).apply()
     }
 
+    fun getTile(): Boolean = prefs.getBoolean("tile", false)
+
+    fun setTile(tile: Boolean) {
+        prefs.edit().putBoolean("tile", tile).apply()
+    }
+
     fun load(): MutableList<TaskList> {
         if (!file.exists()) return mutableListOf()
         val lists = parseLists(file.readText())
@@ -121,14 +157,14 @@ class LocalStore(private val context: Context) {
             val seenItems = mutableSetOf<String>()
             val items = lists[i].items
             for (j in items.indices) {
-                var t = items[j].text
+                var txt = items[j].text
                 var m = 1
-                while (t in seenItems) {
-                    t = "${items[j].text} ($m)"
+                while (txt in seenItems) {
+                    txt = "${items[j].text} ($m)"
                     m++
                 }
-                seenItems.add(t)
-                if (t != items[j].text) items[j] = items[j].copy(text = t)
+                seenItems.add(txt)
+                if (txt != items[j].text) items[j] = items[j].copy(text = txt)
             }
         }
         return lists
@@ -176,6 +212,7 @@ class LocalStore(private val context: Context) {
                 val obj = JSONObject()
                     .put("text", item.text)
                     .put("checked", item.checked)
+                    .put("desc", item.desc)
                 item.due?.let { d -> obj.put("due", d) }
                 obj.put("notif", item.notif)
                 obj.put("notifLead", item.notifLead)
@@ -209,7 +246,8 @@ class LocalStore(private val context: Context) {
                     if (it.has("due")) it.getLong("due") else null,
                     it.optBoolean("notif", false),
                     it.optInt("notifLead", 15),
-                    it.optLong("addedAt", 0L)
+                    it.optLong("addedAt", 0L),
+                    it.optString("desc", "")
                 ))
             }
             result.add(
@@ -267,7 +305,7 @@ class NotifWorker(context: Context, params: WorkerParameters) : Worker(context, 
             nm.createNotificationChannel(
                 NotificationChannel(
                     channelId,
-                    "Rappels d'échéances",
+                    t("Rappels d'échéances", "Due reminders"),
                     NotificationManager.IMPORTANCE_HIGH
                 )
             )
@@ -305,10 +343,18 @@ class NotifWorker(context: Context, params: WorkerParameters) : Worker(context, 
         val notif = NotificationCompat.Builder(ctx, channelId)
             .setSmallIcon(R.drawable.ic_check)
             .setContentTitle(text)
-            .setContentText("Échéance dans moins de $lead min (liste « $list »)")
+            .setContentText(
+                if (lead == 0) t(
+                    "Échéance maintenant ! (liste « $list »)",
+                    "Due now! (list « $list »)"
+                ) else t(
+                    "Échéance dans ${formatLead(lead)} (liste « $list »)",
+                    "Due in ${formatLead(lead)} (list « $list »)"
+                )
+            )
             .setContentIntent(openPi)
-            .addAction(0, "Marquer comme fait", markPi)
-            .addAction(0, "Redéfinir échéance", remindPi)
+            .addAction(0, t("Marquer comme fait", "Mark as done"), markPi)
+            .addAction(0, t("Redéfinir l'échéance", "Reschedule"), remindPi)
             .setAutoCancel(false)
             .build()
         NotificationManagerCompat.from(ctx).notify((list + text).hashCode(), notif)
@@ -461,6 +507,7 @@ fun App(
     var showCopyDataDialog by remember { mutableStateOf(false) }
     var editRequest by remember { mutableStateOf<String?>(null) }
     var scrollRequest by remember { mutableStateOf<String?>(null) }
+    var tileMode by remember { mutableStateOf(store.getTile()) }
 
     // Recharge les données quand l'app revient au premier plan
     // (ex. après « Marquer comme fait » depuis une notification)
@@ -498,7 +545,7 @@ fun App(
     }
 
     // Demande venue d'une notification : ouvre la liste, avec le dialogue
-    // d'édition (« Redéfinir échéance ») ou un défilement jusqu'à l'élément (tap)
+    // d'édition (« Redéfinir l'échéance ») ou un défilement jusqu'à l'élément (tap)
     LaunchedEffect(pendingEdit.value) {
         pendingEdit.value?.let { (listName, itemText, openDialog) ->
             openListName = listName
@@ -534,8 +581,11 @@ fun App(
                     else scheduleNotification(context, current.name, toggled)
                 }
             },
-            onAddItem = { text, due, notif, lead ->
-                val item = TaskItem(text, false, due, notif && due != null, lead, System.currentTimeMillis())
+            onAddItem = { text, due, notif, lead, desc ->
+                val item = TaskItem(
+                    text, false, due, notif && due != null, lead,
+                    System.currentTimeMillis(), desc
+                )
                 lists = lists.map { l ->
                     if (l.name == current.name) l.copy(
                         items = (l.items + item).toMutableList()
@@ -553,7 +603,7 @@ fun App(
                 persist()
                 cancelNotification(context, current.name, item.text)
             },
-            onEditItem = { oldText, newText, newDue, newNotif, newLead ->
+            onEditItem = { oldText, newText, newDue, newNotif, newLead, newDesc ->
                 cancelNotification(context, current.name, oldText)
                 lists = lists.map { l ->
                     if (l.name == current.name) l.copy(
@@ -562,7 +612,8 @@ fun App(
                                 text = newText,
                                 due = newDue,
                                 notif = newNotif && newDue != null,
-                                notifLead = newLead
+                                notifLead = newLead,
+                                desc = newDesc
                             ) else it
                         }.toMutableList()
                     ) else l
@@ -597,6 +648,11 @@ fun App(
             lists = lists,
             themeMode = themeMode.value,
             onThemeChange = onThemeChange,
+            tileMode = tileMode,
+            onTileChange = {
+                tileMode = it
+                store.setTile(it)
+            },
             onOpen = { openListName = it },
             onNewList = { showNewListDialog = true },
             onDeleteList = { name ->
@@ -677,8 +733,8 @@ fun App(
 
     if (showNewListDialog) {
         NameDialog(
-            title = "Nouvelle liste",
-            label = "Nom de la liste",
+            title = t("Nouvelle liste", "New list"),
+            label = t("Nom de la liste", "List name"),
             exists = { name -> lists.any { it.name == name } },
             onConfirm = { name ->
                 if (name.isNotBlank()) {
@@ -694,21 +750,25 @@ fun App(
     if (showCopyDataDialog) {
         AlertDialog(
             onDismissRequest = { showCopyDataDialog = false },
-            title = { Text("Déplacer vos données ?") },
+            title = { Text(t("Déplacer vos données ?", "Move your data?")) },
             text = {
                 Text(
-                    "Copier vos listes actuelles dans le dossier sélectionné ? " +
-                            "Elles y seront synchronisées à chaque modification."
+                    t(
+                        "Copier vos listes actuelles dans le dossier sélectionné ? " +
+                                "Elles y seront synchronisées à chaque modification.",
+                        "Copy your current lists to the selected folder? " +
+                                "They will be synced there on every change."
+                    )
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
                     persist()
                     showCopyDataDialog = false
-                }) { Text("Copier") }
+                }) { Text(t("Copier", "Copy")) }
             },
             dismissButton = {
-                TextButton(onClick = { showCopyDataDialog = false }) { Text("Annuler") }
+                TextButton(onClick = { showCopyDataDialog = false }) { Text(t("Annuler", "Cancel")) }
             }
         )
     }
@@ -729,7 +789,9 @@ fun HomeScreen(
     onImport: (Uri) -> Unit,
     onFolderChosen: (Uri) -> Unit,
     themeMode: Int,
-    onThemeChange: (Int) -> Unit
+    onThemeChange: (Int) -> Unit,
+    tileMode: Boolean,
+    onTileChange: (Boolean) -> Unit
 ) {
     var draggingKey by remember { mutableStateOf<String?>(null) }
     var dragOffset by remember { mutableStateOf(0f) }
@@ -737,6 +799,8 @@ fun HomeScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
     var showThemeDialog by remember { mutableStateOf(false) }
+    var showBugDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     val folderLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -751,181 +815,141 @@ fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("tic-task") },
+                title = { Text("Tic-task") },
                 actions = {
-                    IconButton(onClick = { showInfo = true }) {
-                        Icon(Icons.Filled.Info, contentDescription = "À propos")
+                    // Bascule affichage tuiles / liste (l'icône montre l'autre mode)
+                    IconButton(onClick = { onTileChange(!tileMode) }) {
+                        Icon(
+                            if (tileMode) Icons.Filled.List else Icons.Filled.Apps,
+                            contentDescription = t("Affichage", "Display")
+                        )
                     }
                     IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Options")
+                        Icon(Icons.Filled.Settings, contentDescription = t("Options", "Options"))
                     }
                     DropdownMenu(
                         expanded = showMenu,
                         onDismissRequest = { showMenu = false }
                     ) {
                         DropdownMenuItem(
-                            text = { Text("Thème…") },
+                            text = { Text(t("Thème…", "Theme…")) },
                             onClick = { showMenu = false; showThemeDialog = true }
                         )
                         DropdownMenuItem(
-                            text = { Text("Dossier de sauvegarde…") },
+                            text = { Text(t("Dossier de sauvegarde…", "Backup folder…")) },
                             onClick = { showMenu = false; folderLauncher.launch(null) }
                         )
                         DropdownMenuItem(
-                            text = { Text("Exporter…") },
+                            text = { Text(t("Exporter…", "Export…")) },
                             onClick = {
                                 showMenu = false
                                 exportLauncher.launch("mylist-export.json")
                             }
                         )
                         DropdownMenuItem(
-                            text = { Text("Importer…") },
+                            text = { Text(t("Importer…", "Import…")) },
                             onClick = { showMenu = false; importLauncher.launch(arrayOf("*/*")) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(t("Signaler un bug…", "Report a bug…")) },
+                            onClick = {
+                                showMenu = false
+                                showBugDialog = true
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(t("À propos…", "About…")) },
+                            onClick = { showMenu = false; showInfo = true }
                         )
                     }
                 }
             )
         }
     ) { padding ->
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
-            contentPadding = PaddingValues(8.dp)
-        ) {
-            itemsIndexed(lists, key = { _, l -> l.name }) { index, list ->
-                var showDelete by remember { mutableStateOf(false) }
-                var showRename by remember { mutableStateOf(false) }
-                val isDragging = draggingKey == list.name
+        // Gestion du glisser-déposer partagée entre les deux affichages
+        fun handleDrag(amountY: Float) {
+            dragOffset += amountY
+            val step = when {
+                dragOffset > dragThreshold -> 1
+                dragOffset < -dragThreshold -> -1
+                else -> 0
+            }
+            if (step != 0) {
+                val moved = draggingKey?.let { onMoveList(it, step) } ?: false
+                if (moved) dragOffset -= dragThreshold * step
+            }
+        }
 
-                Card(
+        // Transition douce (fondu croisé) entre liste et tuiles
+        Crossfade(targetState = tileMode) { tiles ->
+            if (tiles) {
+                // Affichage en tuiles : deux cartes par ligne
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
                     modifier = Modifier
-                        .animateItem()
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .shadow(
-                            elevation = if (isDragging) 8.dp else 1.dp,
-                            shape = RoundedCornerShape(12.dp)
-                        )
-                        // La carte suit le doigt pendant le glissement
-                        .graphicsLayer {
-                            if (isDragging) {
-                                translationY = dragOffset
-                                shadowElevation = 16f
-                            }
-                        }
-                        .clickable { onOpen(list.name) }
-                        // Réorganisation : appui long puis glisser
-                        .pointerInput(list.name) {
-                            detectDragGesturesAfterLongPress(
-                                onDragStart = {
-                                    draggingKey = list.name
-                                    dragOffset = 0f
-                                },
-                                onDrag = { change, amount ->
-                                    change.consume()
-                                    dragOffset += amount.y
-                                    val step = when {
-                                        dragOffset > dragThreshold -> 1
-                                        dragOffset < -dragThreshold -> -1
-                                        else -> 0
-                                    }
-                                    if (step != 0) {
-                                        val moved = draggingKey?.let { onMoveList(it, step) } ?: false
-                                        if (moved) dragOffset -= dragThreshold * step
-                                    }
-                                },
-                                onDragEnd = {
-                                    draggingKey = null
-                                    dragOffset = 0f
-                                },
-                                onDragCancel = {
-                                    draggingKey = null
-                                    dragOffset = 0f
-                                }
-                            )
-                        }
+                        .fillMaxSize()
+                        .padding(padding),
+                    contentPadding = PaddingValues(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(start = 12.dp)
-                        ) {
-                            Text(list.name, style = MaterialTheme.typography.titleMedium)
-                            val done = list.items.count { it.checked }
-                            Text(
-                                "$done / ${list.items.size} fait",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        IconButton(onClick = { showRename = true }) {
-                            Icon(
-                                Icons.Filled.Settings,
-                                contentDescription = "Renommer",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        IconButton(onClick = { showDelete = true }) {
-                            Icon(
-                                Icons.Filled.Close,
-                                contentDescription = "Supprimer",
-                                tint = MaterialTheme.colorScheme.error
-                            )
-                        }
+                    items(lists.size, key = { lists[it].name }) { index ->
+                        val list = lists[index]
+                        ListCard(
+                            list = list,
+                            modifier = Modifier.animateItem(),
+                            compact = true,
+                            isDragging = draggingKey == list.name,
+                            dragOffset = dragOffset,
+                            onOpen = onOpen,
+                            onDeleteList = onDeleteList,
+                            onRenameList = onRenameList,
+                            onDragStart = {
+                                draggingKey = list.name
+                                dragOffset = 0f
+                            },
+                            onDrag = { amount -> handleDrag(amount) },
+                            onDragEnd = {
+                                draggingKey = null
+                                dragOffset = 0f
+                            }
+                        )
+                    }
+                    item {
+                        NewListCard(onNewList, compact = true)
                     }
                 }
-                if (showDelete) {
-                    AlertDialog(
-                        onDismissRequest = { showDelete = false },
-                        title = { Text("Supprimer « ${list.name} » ?") },
-                        confirmButton = {
-                            TextButton(onClick = { onDeleteList(list.name); showDelete = false }) {
-                                Text("Supprimer")
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { showDelete = false }) { Text("Annuler") }
-                        }
-                    )
-                }
-                if (showRename) {
-                    NameDialog(
-                        title = "Renommer la liste",
-                        label = "Nom de la liste",
-                        initial = list.name,
-                        exists = { newName -> lists.any { it.name == newName } },
-                        onConfirm = { newName ->
-                            if (newName.isNotBlank() && newName != list.name) {
-                                onRenameList(list.name, newName.trim())
-                            }
-                            showRename = false
-                        },
-                        onDismiss = { showRename = false }
-                    )
-                }
-            }
-            // Dernier élément : bouton pour créer une nouvelle liste
-            item {
-                Card(
+            } else {
+                LazyColumn(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .clickable { onNewList() },
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFF8E1F3F),
-                        contentColor = Color.White
-                    )
+                        .fillMaxSize()
+                        .padding(padding),
+                    contentPadding = PaddingValues(8.dp)
                 ) {
-                    Text(
-                        "➕  Nouvelle liste",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(16.dp)
-                    )
+                    itemsIndexed(lists, key = { _, l -> l.name }) { _, list ->
+                        ListCard(
+                            list = list,
+                            modifier = Modifier.animateItem(),
+                            isDragging = draggingKey == list.name,
+                            dragOffset = dragOffset,
+                            onOpen = onOpen,
+                            onDeleteList = onDeleteList,
+                            onRenameList = onRenameList,
+                            onDragStart = {
+                                draggingKey = list.name
+                                dragOffset = 0f
+                            },
+                            onDrag = { amount -> handleDrag(amount) },
+                            onDragEnd = {
+                                draggingKey = null
+                                dragOffset = 0f
+                            }
+                        )
+                    }
+                    // Dernier élément : bouton pour créer une nouvelle liste
+                    item {
+                        NewListCard(onNewList)
+                    }
                 }
             }
         }
@@ -934,16 +958,36 @@ fun HomeScreen(
     if (showInfo) {
         AlertDialog(
             onDismissRequest = { showInfo = false },
-            title = { Text("tic-task") },
+            title = { Text("Tic-task") },
             text = {
                 Column {
-                    Text("tic-task 1.0.1 — 6 novembre 2026", style = MaterialTheme.typography.titleMedium)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("Date de sortie : 6 novembre 2026")
                     Text(
-                        "Application de listes de tâches 100 % locale : " +
-                                "aucune donnée ne quitte votre téléphone.",
+                        "Tic-task 1.1 — 6 novembre 2026",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(t("Date de sortie : 6 novembre 2026", "Release date: November 6, 2026"))
+                    Text(
+                        t(
+                            "Application de listes de tâches 100 % locale : " +
+                                    "aucune donnée ne quitte votre téléphone.",
+                            "100% local to-do list app: " +
+                                    "no data ever leaves your phone."
+                        ),
                         style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        t(
+                            "Mises à jour : l'app Obtainium (gratuite, sur GitHub) peut " +
+                                    "suivre les nouvelles versions de Tic-task et vous " +
+                                    "proposer leur installation automatique.",
+                            "Updates: the Obtainium app (free, on GitHub) can track " +
+                                    "new Tic-task versions and offer to install them " +
+                                    "automatically."
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             },
@@ -953,27 +997,237 @@ fun HomeScreen(
         )
     }
 
+    // Confirmation avant de quitter l'app vers le navigateur (page GitHub)
+    if (showBugDialog) {
+        AlertDialog(
+            onDismissRequest = { showBugDialog = false },
+            title = { Text(t("Signaler un bug", "Report a bug")) },
+            text = {
+                Text(
+                    t(
+                        "Ouvrir la page de signalement dans votre navigateur ?\n\n" +
+                                "L'application va s'ouvrir sur GitHub — aucune de vos données " +
+                                "ne quitte votre téléphone, seule la page web s'ouvre.",
+                        "Open the report page in your browser?\n\n" +
+                                "The app will open GitHub — none of your data " +
+                                "leaves your phone, only the web page opens."
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBugDialog = false
+                    val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_ISSUES_URL))
+                    context.startActivity(browserIntent)
+                }) { Text(t("Ouvrir", "Open")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBugDialog = false }) { Text(t("Annuler", "Cancel")) }
+            }
+        )
+    }
+
     if (showThemeDialog) {
         AlertDialog(
             onDismissRequest = { showThemeDialog = false },
-            title = { Text("Thème de l'application") },
+            title = { Text(t("Thème de l'application", "App theme")) },
             text = {
                 Column {
-                    ThemeOption("Système (par défaut)", themeMode == 0) {
+                    ThemeOption(t("Système (par défaut)", "System (default)"), themeMode == 0) {
                         onThemeChange(0); showThemeDialog = false
                     }
-                    ThemeOption("Clair", themeMode == 1) {
+                    ThemeOption(t("Clair", "Light"), themeMode == 1) {
                         onThemeChange(1); showThemeDialog = false
                     }
-                    ThemeOption("Sombre", themeMode == 2) {
+                    ThemeOption(t("Sombre", "Dark"), themeMode == 2) {
                         onThemeChange(2); showThemeDialog = false
                     }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showThemeDialog = false }) { Text("Annuler") }
+                TextButton(onClick = { showThemeDialog = false }) { Text(t("Annuler", "Cancel")) }
             }
         )
+    }
+}
+
+// Carte d'une liste sur l'écran d'accueil (utilisée en liste et en tuiles)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ListCard(
+    list: TaskList,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+    isDragging: Boolean,
+    dragOffset: Float,
+    onOpen: (String) -> Unit,
+    onDeleteList: (String) -> Unit,
+    onRenameList: (String, String) -> Unit,
+    onDragStart: () -> Unit,
+    onDrag: (Float) -> Unit,
+    onDragEnd: () -> Unit
+) {
+    var showDelete by remember { mutableStateOf(false) }
+    var showRename by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = modifier
+            // Tuiles : carrées (ratio 1:1) ; liste : pleine largeur
+            .then(if (compact) Modifier.aspectRatio(1f) else Modifier.fillMaxWidth())
+            // Marge verticale uniquement en mode liste (la grille gère son espacement)
+            .then(if (!compact) Modifier.padding(vertical = 4.dp) else Modifier)
+            .shadow(
+                elevation = if (isDragging) 8.dp else 1.dp,
+                shape = RoundedCornerShape(12.dp)
+            )
+            // La carte suit le doigt pendant le glissement
+            .graphicsLayer {
+                if (isDragging) {
+                    translationY = dragOffset
+                    shadowElevation = 16f
+                }
+            }
+            .clickable { onOpen(list.name) }
+            // Réorganisation : appui long puis glisser
+            .pointerInput(list.name) {
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { onDragStart() },
+                    onDrag = { change, amount ->
+                        change.consume()
+                        onDrag(amount.y)
+                    },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { onDragEnd() }
+                )
+            }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(start = 12.dp)
+            ) {
+                Text(
+                    list.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = if (compact) 2 else Int.MAX_VALUE,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val done = list.items.count { it.checked }
+                Text(
+                    t("$done / ${list.items.size} fait", "$done / ${list.items.size} done"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            // Tuiles : boutons empilés verticalement ; liste : en ligne
+            if (compact) {
+                Column {
+                    IconButton(onClick = { showRename = true }) {
+                        Icon(
+                            Icons.Filled.Edit,
+                            contentDescription = t("Renommer", "Rename"),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(onClick = { showDelete = true }) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = t("Supprimer", "Delete"),
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            } else {
+                IconButton(onClick = { showRename = true }) {
+                    Icon(
+                        Icons.Filled.Edit,
+                        contentDescription = t("Renommer", "Rename"),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = { showDelete = true }) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = t("Supprimer", "Delete"),
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        }
+    }
+
+    if (showDelete) {
+        AlertDialog(
+            onDismissRequest = { showDelete = false },
+            title = { Text(t("Supprimer « ${list.name} » ?", "Delete « ${list.name} »?")) },
+            confirmButton = {
+                TextButton(onClick = { onDeleteList(list.name); showDelete = false }) {
+                    Text(t("Supprimer", "Delete"))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDelete = false }) { Text(t("Annuler", "Cancel")) }
+            }
+        )
+    }
+
+    if (showRename) {
+        NameDialog(
+            title = t("Renommer la liste", "Rename list"),
+            label = t("Nom de la liste", "List name"),
+            initial = list.name,
+            exists = { newName -> newName != list.name },
+            onConfirm = { newName ->
+                onRenameList(list.name, newName.trim())
+                showRename = false
+            },
+            onDismiss = { showRename = false }
+        )
+    }
+}
+
+// Carte « ➕ Nouvelle liste » (liste : pleine largeur ; tuiles : carrée)
+@Composable
+fun NewListCard(onNewList: () -> Unit, compact: Boolean = false) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (compact) Modifier.aspectRatio(1f) else Modifier.padding(vertical = 4.dp))
+            .clickable { onNewList() },
+        colors = CardDefaults.cardColors(
+            containerColor = Color(0xFF8E1F3F),
+            contentColor = Color.White
+        )
+    ) {
+        if (compact) {
+            // Tuiles : carré centré avec un gros « + » et le libellé en petit
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("➕", style = MaterialTheme.typography.headlineMedium)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        t("Nouvelle liste", "New list"),
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                }
+            }
+        } else {
+            Text(
+                t("➕  Nouvelle liste", "➕  New list"),
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(16.dp)
+            )
+        }
     }
 }
 
@@ -1021,9 +1275,9 @@ fun ListScreen(
     list: TaskList,
     onBack: () -> Unit,
     onToggle: (TaskItem) -> Unit,
-    onAddItem: (String, Long?, Boolean, Int) -> Unit,
+    onAddItem: (String, Long?, Boolean, Int, String) -> Unit,
     onDeleteItem: (TaskItem) -> Unit,
-    onEditItem: (String, String, Long?, Boolean, Int) -> Unit,
+    onEditItem: (String, String, Long?, Boolean, Int, String) -> Unit,
     onListSettings: (Int) -> Unit,
     onSortChange: (Int) -> Unit,
     editRequest: String? = null,
@@ -1036,6 +1290,7 @@ fun ListScreen(
     var deleteItem by remember { mutableStateOf<TaskItem?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var showSortDialog by remember { mutableStateOf(false) }
+    var addNonce by remember { mutableStateOf(0) }
     val listState = rememberLazyListState()
 
     // Ouvre le dialogue d'édition quand on vient d'une notification
@@ -1070,7 +1325,7 @@ fun ListScreen(
                 title = { Text(list.name) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Retour")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = t("Retour", "Back"))
                     }
                 },
                 actions = {
@@ -1078,12 +1333,12 @@ fun ListScreen(
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Icon(
                                 Icons.Filled.KeyboardArrowUp,
-                                "Tri croissant",
+                                t("Tri croissant", "Sort ascending"),
                                 modifier = Modifier.size(18.dp)
                             )
                             Icon(
                                 Icons.Filled.KeyboardArrowDown,
-                                "Tri décroissant",
+                                t("Tri décroissant", "Sort descending"),
                                 modifier = Modifier.size(18.dp)
                             )
                         }
@@ -1091,13 +1346,13 @@ fun ListScreen(
                     IconButton(onClick = { showSettings = true }) {
                         Icon(
                             Icons.Filled.Settings,
-                            contentDescription = "Options de la liste"
+                            contentDescription = t("Options de la liste", "List options")
                         )
                     }
                     IconButton(onClick = { showAddDialog = true }) {
                         Icon(
                             Icons.Filled.Add,
-                            contentDescription = "Ajouter un élément"
+                            contentDescription = t("Ajouter un élément", "Add item")
                         )
                     }
                 }
@@ -1113,7 +1368,7 @@ fun ListScreen(
         ) {
             item {
                 Text(
-                    "À faire",
+                    t("À faire", "To do"),
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(start = 8.dp, top = 8.dp)
@@ -1126,7 +1381,7 @@ fun ListScreen(
             if (done.isNotEmpty()) {
                 item {
                     Text(
-                        "Effectués",
+                        t("Effectués", "Done"),
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(start = 8.dp, top = 16.dp)
@@ -1144,33 +1399,44 @@ fun ListScreen(
                         contentColor = MaterialTheme.colorScheme.primary
                     )
                 ) {
-                    Text("➕  Ajouter un élément")
+                    Text(t("➕  Ajouter un élément", "➕  Add item"))
                 }
             }
         }
     }
 
+    // « Entrée » dans le champ texte : crée l'élément et rouvre immédiatement
+    // un dialogue vierge (key(addNonce) force la réinitialisation des champs)
     if (showAddDialog) {
-        EntryDialog(
-            initialNotifLead = list.defaultNotifLead,
-            exists = { t -> list.items.any { it.text == t } },
-            onConfirm = { text, due, notif, lead ->
-                if (text.isNotBlank()) onAddItem(text.trim(), due, notif, lead)
-                showAddDialog = false
-            },
-            onDismiss = { showAddDialog = false }
-        )
+        key(addNonce) {
+            EntryDialog(
+                initialNotifLead = list.defaultNotifLead,
+                exists = { name -> list.items.any { it.text == name } },
+                onConfirm = { text, due, notif, lead, desc ->
+                    if (text.isNotBlank()) onAddItem(text, due, notif, lead, desc)
+                    showAddDialog = false
+                },
+                onConfirmNew = { text, due, notif, lead, desc ->
+                    if (text.isNotBlank()) {
+                        onAddItem(text, due, notif, lead, desc)
+                        addNonce++
+                    }
+                },
+                onDismiss = { showAddDialog = false }
+            )
+        }
     }
 
     editItem?.let { item ->
         EntryDialog(
             initialText = item.text,
+            initialDesc = item.desc,
             initialDue = item.due,
             initialNotif = item.notif,
             initialNotifLead = item.notifLead,
-            exists = { t -> list.items.any { it.text == t } },
-            onConfirm = { text, due, notif, lead ->
-                if (text.isNotBlank()) onEditItem(item.text, text.trim(), due, notif, lead)
+            exists = { name -> list.items.any { it.text == name } },
+            onConfirm = { text, due, notif, lead, desc ->
+                if (text.isNotBlank()) onEditItem(item.text, text.trim(), due, notif, lead, desc)
                 editItem = null
             },
             onDismiss = { editItem = null }
@@ -1178,12 +1444,11 @@ fun ListScreen(
     }
 
     if (showSettings) {
-        NameDialog(
-            title = "Notification par défaut",
-            label = "Minutes avant l'échéance",
-            initial = list.defaultNotifLead.toString(),
-            onConfirm = { value ->
-                value.toIntOrNull()?.let { onListSettings(it.coerceIn(0, 10080)) }
+        ReminderDialog(
+            title = t("Notification par défaut", "Default notification"),
+            initialMinutes = list.defaultNotifLead,
+            onConfirm = { minutes ->
+                onListSettings(minutes.coerceIn(0, 10080))
                 showSettings = false
             },
             onDismiss = { showSettings = false }
@@ -1193,16 +1458,16 @@ fun ListScreen(
     if (showSortDialog) {
         AlertDialog(
             onDismissRequest = { showSortDialog = false },
-            title = { Text("Trier par") },
+            title = { Text(t("Trier par", "Sort by")) },
             text = {
                 Column {
-                    SortOption("Alphabétique", list.sortMode == 0, list.sortDesc) { onSortChange(0) }
-                    SortOption("Date d'échéance", list.sortMode == 1, list.sortDesc) { onSortChange(1) }
-                    SortOption("Date d'ajout", list.sortMode == 2, list.sortDesc) { onSortChange(2) }
+                    SortOption(t("Alphabétique", "Alphabetical"), list.sortMode == 0, list.sortDesc) { onSortChange(0) }
+                    SortOption(t("Date d'échéance", "Due date"), list.sortMode == 1, list.sortDesc) { onSortChange(1) }
+                    SortOption(t("Date d'ajout", "Added date"), list.sortMode == 2, list.sortDesc) { onSortChange(2) }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showSortDialog = false }) { Text("Fermer") }
+                TextButton(onClick = { showSortDialog = false }) { Text(t("Fermer", "Close")) }
             }
         )
     }
@@ -1210,20 +1475,20 @@ fun ListScreen(
     deleteItem?.let { item ->
         AlertDialog(
             onDismissRequest = { deleteItem = null },
-            title = { Text("Supprimer « ${item.text} » ?") },
+            title = { Text(t("Supprimer « ${item.text} » ?", "Delete « ${item.text} »?")) },
             confirmButton = {
                 TextButton(onClick = { onDeleteItem(item); deleteItem = null }) {
-                    Text("Supprimer")
+                    Text(t("Supprimer", "Delete"))
                 }
             },
             dismissButton = {
-                TextButton(onClick = { deleteItem = null }) { Text("Annuler") }
+                TextButton(onClick = { deleteItem = null }) { Text(t("Annuler", "Cancel")) }
             }
         )
     }
 }
 
-// Une ligne d'élément : case à cocher, nom cliquable (pour modifier), échéance éventuelle, croix
+// Une ligne d'élément : case à cocher, nom + description, échéance, croix
 @Composable
 fun EntryRow(
     modifier: Modifier = Modifier,
@@ -1242,17 +1507,30 @@ fun EntryRow(
             checked = item.checked,
             onCheckedChange = { onToggle(item) }
         )
-        Text(
-            item.text,
+        Column(
             modifier = Modifier
                 .weight(1f)
-                .clickable { onEdit() },
-            style = MaterialTheme.typography.bodyLarge,
-            color = if (item.checked)
-                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
-            else
-                MaterialTheme.colorScheme.onSurface
-        )
+                .clickable { onEdit() }
+        ) {
+            Text(
+                item.text,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (item.checked)
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+                else
+                    MaterialTheme.colorScheme.onSurface
+            )
+            if (item.desc.isNotBlank()) {
+                Text(
+                    item.desc,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (item.checked)
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+                    else
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                )
+            }
+        }
         if (item.due != null) {
             Text(
                 formatDue(item.due!!),
@@ -1269,7 +1547,7 @@ fun EntryRow(
         IconButton(onClick = onDelete) {
             Icon(
                 Icons.Filled.Close,
-                contentDescription = "Supprimer",
+                contentDescription = t("Supprimer", "Delete"),
                 tint = MaterialTheme.colorScheme.error
             )
         }
@@ -1306,7 +1584,7 @@ fun NameDialog(
                 supportingText = {
                     if (duplicate) {
                         Text(
-                            "Ce nom existe déjà",
+                            t("Ce nom existe déjà", "This name already exists"),
                             color = MaterialTheme.colorScheme.error
                         )
                     }
@@ -1315,20 +1593,116 @@ fun NameDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onConfirm(text) },
+                onClick = { onConfirm(text.trim()) },
                 enabled = !duplicate
             ) { Text("OK") }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Annuler") }
+            TextButton(onClick = onDismiss) { Text(t("Annuler", "Cancel")) }
         }
     )
 }
 
-// ---------- Boîte de dialogue d'un élément : texte + échéance optionnelle ----------
+// ---------- Boîte de dialogue de rappel : valeur + unité (min / h / j) ----------
 
-fun formatDue(millis: Long): String =
-    SimpleDateFormat("d MMM HH:mm", Locale.getDefault()).format(Date(millis))
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun ReminderDialog(
+    title: String,
+    initialMinutes: Int,
+    onConfirm: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var unit by remember {
+        mutableStateOf(
+            if (initialMinutes == 0) 3
+            else if (initialMinutes >= 1440 && initialMinutes % 1440 == 0) 2
+            else if (initialMinutes >= 60 && initialMinutes % 60 == 0) 1 else 0
+        )
+    }
+    var valueText by remember {
+        mutableStateOf(
+            (
+                    if (initialMinutes >= 1440 && initialMinutes % 1440 == 0) initialMinutes / 1440
+                    else if (initialMinutes >= 60 && initialMinutes % 60 == 0) initialMinutes / 60
+                    else initialMinutes
+                    ).toString()
+        )
+    }
+    val unitLabels = listOf(
+        t("Minutes", "Minutes"), t("Heures", "Hours"),
+        t("Jours", "Days"), t("À l'heure", "On time")
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                // « À l'heure » : pas de valeur à saisir (rappel à 0 minute)
+                if (unit != 3) {
+                    OutlinedTextField(
+                        value = valueText,
+                        onValueChange = { v ->
+                            if (v.all(Char::isDigit) && v.length <= 4) valueText = v
+                        },
+                        label = { Text(t("Délai avant l'échéance", "Time before due")) },
+                        singleLine = true
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                // Deux lignes de deux chips pour un rendu régulier
+                Column {
+                    for (chipRow in listOf(listOf(0, 1), listOf(2, 3))) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(top = 4.dp)
+                        ) {
+                            chipRow.forEach { i ->
+                                FilterChip(
+                                    selected = unit == i,
+                                    onClick = { unit = i },
+                                    label = { Text(unitLabels[i]) },
+                                    // Taille identique : chaque chip occupe la moitié de la ligne
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val value = valueText.toIntOrNull() ?: 0
+                val mul = listOf(1, 60, 1440, 0)[unit]
+                onConfirm(value * mul)
+            }) { Text("OK") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(t("Annuler", "Cancel")) }
+        }
+    )
+}
+
+// ---------- Boîte de dialogue d'un élément : texte, description, échéance ----------
+
+fun formatDue(millis: Long): String {
+    fun dayNumber(c: Calendar) = c.get(Calendar.YEAR) * 1000 + c.get(Calendar.DAY_OF_YEAR)
+    val now = Calendar.getInstance()
+    val today = dayNumber(now)
+    val cal = Calendar.getInstance().apply { timeInMillis = millis }
+    return when (dayNumber(cal)) {
+        today -> t(
+            "Aujourd'hui " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(millis)),
+            "Today " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(millis))
+        )
+        today + 1 -> t(
+            "Demain " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(millis)),
+            "Tomorrow " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(millis))
+        )
+        else -> SimpleDateFormat("d MMM HH:mm", Locale.getDefault()).format(Date(millis))
+    }
+}
 
 fun defaultDueToday(): Long =
     Calendar.getInstance().apply {
@@ -1338,50 +1712,113 @@ fun defaultDueToday(): Long =
         set(Calendar.MILLISECOND, 0)
     }.timeInMillis
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun EntryDialog(
     initialText: String = "",
+    initialDesc: String = "",
     initialDue: Long? = null,
     initialNotif: Boolean = false,
     initialNotifLead: Int = 15,
     exists: (String) -> Boolean = { false },
-    onConfirm: (String, Long?, Boolean, Int) -> Unit,
+    onConfirm: (String, Long?, Boolean, Int, String) -> Unit,
+    onConfirmNew: ((String, Long?, Boolean, Int, String) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     var text by remember { mutableStateOf(initialText) }
+    var desc by remember { mutableStateOf(initialDesc) }
     var hasDue by remember { mutableStateOf(initialDue != null) }
     var due by remember { mutableStateOf(initialDue) }
     var hasNotif by remember { mutableStateOf(initialNotif) }
-    var notifLeadText by remember { mutableStateOf(initialNotifLead.toString()) }
+    // Décomposition du délai initial (minutes) en valeur + unité (min / h / j)
+    var notifUnit by remember {
+        mutableStateOf(
+            if (initialNotifLead == 0) 3
+            else if (initialNotifLead >= 1440 && initialNotifLead % 1440 == 0) 2
+            else if (initialNotifLead >= 60 && initialNotifLead % 60 == 0) 1 else 0
+        )
+    }
+    var notifValueText by remember {
+        mutableStateOf(
+            (
+                    if (initialNotifLead >= 1440 && initialNotifLead % 1440 == 0) initialNotifLead / 1440
+                    else if (initialNotifLead >= 60 && initialNotifLead % 60 == 0) initialNotifLead / 60
+                    else initialNotifLead
+                    ).toString()
+        )
+    }
     var showDatePicker by remember { mutableStateOf(false) }
     var showTimePicker by remember { mutableStateOf(false) }
     var pendingDate by remember { mutableStateOf(0L) }
     val duplicate = text.isNotBlank() &&
             text.trim() != initialText.trim() &&
             exists(text.trim())
+    val unitLabels = listOf(
+        t("Minutes", "Minutes"), t("Heures", "Hours"),
+        t("Jours", "Days"), t("À l'heure", "On time")
+    )
+
+    fun computeLead(): Int {
+        val value = notifValueText.toIntOrNull() ?: 0
+        return value * listOf(1, 60, 1440, 0)[notifUnit]
+    }
+
+    fun confirmValue(callback: (String, Long?, Boolean, Int, String) -> Unit) {
+        if (text.isNotBlank() && !duplicate) {
+            callback(text.trim(), if (hasDue) due else null, hasDue && hasNotif, computeLead(), desc.trim())
+        }
+    }
+
+    // Curseur et clavier prêts dès l'ouverture du formulaire de création
+    val textFocus = remember { FocusRequester() }
+    val descFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        if (onConfirmNew != null) textFocus.requestFocus()
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
-            Text(if (initialText.isEmpty()) "Nouvel élément" else "Modifier l'élément")
+            Text(
+                if (initialText.isEmpty()) t("Nouvel élément", "New item")
+                else t("Modifier l'élément", "Edit item")
+            )
         },
         text = {
             Column {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
-                    label = { Text("Texte de l'élément") },
+                    label = { Text(t("Texte de l'élément", "Item text")) },
                     singleLine = true,
                     isError = duplicate,
                     supportingText = {
                         if (duplicate) {
                             Text(
-                                "Ce nom existe déjà",
+                                t("Ce nom existe déjà", "This name already exists"),
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
-                    }
+                    },
+                    modifier = Modifier.focusRequester(textFocus),
+                    // « Entrée » ici : passe au champ description
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    keyboardActions = KeyboardActions(onNext = { descFocus.requestFocus() })
+                )
+                OutlinedTextField(
+                    value = desc,
+                    onValueChange = { desc = it },
+                    label = { Text(t("Description (optionnel)", "Description (optional)")) },
+                    singleLine = true,
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .focusRequester(descFocus),
+                    // « Entrée » ici : crée l'élément et rouvre un formulaire vierge
+                    // (uniquement en mode création)
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = {
+                        if (onConfirmNew != null) confirmValue(onConfirmNew)
+                    })
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
@@ -1396,7 +1833,7 @@ fun EntryDialog(
                             if (!checked) { due = null; hasNotif = false }
                         }
                     )
-                    Text("Échéance")
+                    Text(t("Échéance", "Due date"))
                 }
                 if (hasDue) {
                     OutlinedButton(onClick = { showDatePicker = true }) {
@@ -1407,32 +1844,51 @@ fun EntryDialog(
                             checked = hasNotif,
                             onCheckedChange = { hasNotif = it }
                         )
-                        Text("Notification")
+                        Text(t("Notification", "Notification"))
                     }
                     if (hasNotif) {
-                        OutlinedTextField(
-                            value = notifLeadText,
-                            onValueChange = { value ->
-                                if (value.all(Char::isDigit) && value.length <= 4) notifLeadText = value
-                            },
-                            label = { Text("Minutes avant l'échéance") },
-                            singleLine = true
-                        )
+                        // « À l'heure » : pas de valeur à saisir (rappel à 0 minute)
+                        if (notifUnit != 3) {
+                            OutlinedTextField(
+                                value = notifValueText,
+                                onValueChange = { v ->
+                                    if (v.all(Char::isDigit) && v.length <= 4) notifValueText = v
+                                },
+                                label = { Text(t("Délai avant l'échéance", "Time before due")) },
+                                singleLine = true
+                            )
+                        }
+                        // Deux lignes de deux chips pour un rendu régulier
+                        Column {
+                            for (chipRow in listOf(listOf(0, 1), listOf(2, 3))) {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.padding(top = 4.dp)
+                                ) {
+                                    chipRow.forEach { i ->
+                                        FilterChip(
+                                            selected = notifUnit == i,
+                                            onClick = { notifUnit = i },
+                                            label = { Text(unitLabels[i]) },
+                                            // Taille identique : chaque chip occupe la moitié de la ligne
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         },
         confirmButton = {
             TextButton(
-                onClick = {
-                    val lead = notifLeadText.toIntOrNull() ?: initialNotifLead
-                    onConfirm(text, if (hasDue) due else null, hasDue && hasNotif, lead)
-                },
+                onClick = { confirmValue(onConfirm) },
                 enabled = !duplicate
             ) { Text("OK") }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Annuler") }
+            TextButton(onClick = onDismiss) { Text(t("Annuler", "Cancel")) }
         }
     )
 
@@ -1448,10 +1904,10 @@ fun EntryDialog(
                     pendingDate = dateState.selectedDateMillis ?: System.currentTimeMillis()
                     showDatePicker = false
                     showTimePicker = true
-                }) { Text("Suivant") }
+                }) { Text(t("Suivant", "Next")) }
             },
             dismissButton = {
-                TextButton(onClick = { showDatePicker = false }) { Text("Annuler") }
+                TextButton(onClick = { showDatePicker = false }) { Text(t("Annuler", "Cancel")) }
             }
         ) {
             DatePicker(state = dateState)
@@ -1469,7 +1925,7 @@ fun EntryDialog(
         )
         AlertDialog(
             onDismissRequest = { showTimePicker = false },
-            title = { Text("Heure") },
+            title = { Text(t("Heure", "Time")) },
             text = { TimeInput(state = timeState) },
             confirmButton = {
                 TextButton(onClick = {
@@ -1488,7 +1944,7 @@ fun EntryDialog(
                 }) { Text("OK") }
             },
             dismissButton = {
-                TextButton(onClick = { showTimePicker = false }) { Text("Annuler") }
+                TextButton(onClick = { showTimePicker = false }) { Text(t("Annuler", "Cancel")) }
             }
         )
     }
