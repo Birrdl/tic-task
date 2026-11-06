@@ -1,35 +1,43 @@
-# tic-task
+# Tic-task
 
-Gestionnaire de listes de tâches pour Android — **100 % local, 100 % hors ligne**.
-Aucune permission sensible, aucun accès Internet : tes données restent sur ton téléphone.
+To-do list manager for Android — **100% local, 100% offline**.
+No sensitive permissions, no Internet access: your data stays on your phone.
 
-## ✨ Fonctionnalités
+## ✨ Features
 
-- **Listes de tâches** illimitées, renommables, réorganisables par glisser-déposer
-- **Échéances** avec date et heure, et **notifications** configurables (rappel avant l'échéance)
-- **Tri** par ordre alphabétique, date d'échéance ou date d'ajout (croissant/décroissant)
-- Les éléments **cochés passent automatiquement en bas** de la liste (« À faire » / « Effectués »)
-- **Thème** clair, sombre ou automatique (suit le système)
-- **Sauvegarde** : export/import JSON, copie miroir dans un dossier de ton choix
-- « **Marquer comme fait** » directement depuis la notification
+- **Unlimited to-do lists**: create, rename, reorder by drag & drop
+- Optional **description** for each item, shown in small text below the title
+- **Due dates** with date and time ("Today" / "Tomorrow" when close), plus configurable **notifications** (reminder in minutes, hours or days before the deadline)
+- **Quick entry**: the Enter key creates the item and instantly opens a fresh form
+- **Sort** alphabetically, by due date or by added date (ascending/descending)
+- Checked items **move to the bottom automatically** ("To do" / "Done")
+- **Home display**: classic list or tiles (2 per row), your choice
+- **Bilingual**: French or English interface, following the phone's language
+- **Theme**: light, dark or automatic (follows the system)
+- **Backup**: JSON export/import, mirror copy to a folder of your choice
+- **"Mark as done"** straight from the notification
+- **Report a bug** from the app (opens the GitHub issue page in your browser)
 
 ## 📱 Installation
 
-Télécharge l'APK depuis la page [Releases](../../releases), puis installe-le
-(autoriser « installer depuis des sources inconnues » si demandé).
+Download the APK from the [Releases](../../releases) page, then install it
+(allow "install from unknown sources" if prompted).
 
-## 🔒 Vie privée
+You can also install [Obtainium](https://github.com/ImranR98/Obtainium) (free, open source)
+to get automatic update notifications for this app.
 
-L'application ne demande que la permission d'afficher des notifications.
-Toutes les données sont stockées dans un simple fichier `lists.json` dans
-l'espace privé de l'application. Aucune télémétrie, aucun réseau.
+## 🔒 Privacy
 
-## 🛠️ Compilation
+The app only asks for the permission to display notifications.
+All data is stored in a single `lists.json` file inside the app's private
+storage. No telemetry, no network.
 
-1. Ouvrir le projet dans Android Studio (Ladybug ou plus récent)
-2. Laisser Gradle synchroniser
+## 🛠️ Building
+
+1. Open the project in Android Studio (Ladybug or newer)
+2. Let Gradle sync
 3. **Build → Build App Bundle(s)/APK(s) → Build APK(s)**
 
-## 📄 Licence
+## 📄 License
 
-Projet personnel — tous droits réservés.
+Personal project — all rights reserved.
