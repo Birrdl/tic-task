@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.mylist"
         minSdk = 24
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.1"
+        versionCode = 4
+        versionName = "1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -22,7 +22,7 @@ android {
     buildTypes {
         release {
             optimization {
-                enable = true
+                enable = false
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
             }
         }
@@ -49,6 +49,7 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.9.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
+    implementation("androidx.glance:glance-appwidget:1.1.1")
     testImplementation(libs.junit)
     implementation("androidx.compose.material:material-icons-extended")
     androidTestImplementation(platform(libs.androidx.compose.bom))

@@ -58,8 +58,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -69,6 +71,32 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.work.*
+import androidx.glance.GlanceId
+import androidx.glance.GlanceModifier
+import androidx.glance.appwidget.GlanceAppWidget
+import androidx.glance.appwidget.GlanceAppWidgetReceiver
+import androidx.glance.appwidget.SizeMode
+import androidx.glance.appwidget.cornerRadius
+import androidx.glance.appwidget.provideContent
+import androidx.glance.background
+import androidx.glance.text.FontWeight
+import androidx.glance.text.Text
+import androidx.glance.text.TextStyle
+import androidx.glance.unit.ColorProvider
+// Alias : Glance utilise les mêmes noms que Compose (Column, LazyColumn…)
+import androidx.glance.appwidget.lazy.LazyColumn as GLazyColumn
+import androidx.glance.appwidget.lazy.items as gItems
+import androidx.glance.layout.Column as GColumn
+import androidx.glance.layout.Spacer as GSpacer
+import androidx.glance.layout.fillMaxSize as gFillMaxSize
+import androidx.glance.layout.fillMaxWidth as gFillMaxWidth
+import androidx.glance.layout.height as gHeight
+import androidx.glance.layout.padding as gPadding
+import androidx.glance.appwidget.updateAll
+import androidx.compose.ui.unit.DpSize
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -378,6 +406,10 @@ class MarkDoneReceiver : BroadcastReceiver() {
             // Retire la notification affichée
             NotificationManagerCompat.from(context).cancel((listName + itemText).hashCode())
             store.save(lists)
+            // Rafraîchit le widget d'accueil (coche faite depuis une notification)
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching { TasksWidget.updateAll(context) }
+            }
             // Prévient l'app si elle est ouverte, pour rafraîchir l'affichage
             // immédiatement (sinon l'état en mémoire écraserait la coche)
             context.sendBroadcast(
@@ -386,6 +418,92 @@ class MarkDoneReceiver : BroadcastReceiver() {
                     .putExtra("list", listName)
                     .putExtra("item", itemText)
             )
+        }
+    }
+}
+
+// ---------- Widget d'accueil : prochaines échéances, toutes listes confondues ----------
+
+class TasksWidgetReceiver : GlanceAppWidgetReceiver() {
+    override val glanceAppWidget: GlanceAppWidget = TasksWidget
+}
+
+data class WidgetTask(val list: String, val text: String, val due: Long)
+
+object TasksWidget : GlanceAppWidget() {
+    // Le contenu est recalculé quand la hauteur du widget change (3×3 → 6×8)
+    override val sizeMode = SizeMode.Responsive(
+        setOf(
+            DpSize(180.dp, 180.dp),  // 3×3 cellules
+            DpSize(180.dp, 280.dp),
+            DpSize(180.dp, 400.dp),
+            DpSize(180.dp, 530.dp)   // 6×8 cellules
+        )
+    )
+
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        // Tâches non cochées avec une échéance, toutes listes confondues, triées par échéance
+        val tasks = runCatching { LocalStore(context).load() }
+            .getOrDefault(mutableListOf())
+            .flatMap { l ->
+                l.items.filter { !it.checked && it.due != null }
+                    .map { WidgetTask(l.name, it.text, it.due!!) }
+            }
+            .sortedBy { it.due }
+            .take(20)
+        provideContent { WidgetContent(tasks) }
+    }
+}
+
+@Composable
+fun WidgetContent(tasks: List<WidgetTask>) {
+    val anthracite = ColorProvider(Color(0xFF26282D))
+    val white = ColorProvider(Color(0xFFF2F2F2))
+    val grey = ColorProvider(Color(0xFFB8BCC2))
+    val bordeaux = ColorProvider(Color(0xFFD4776F))
+    val now = System.currentTimeMillis()
+    GColumn(
+        modifier = GlanceModifier
+            .gFillMaxSize()
+            .background(anthracite)
+            .cornerRadius(16.dp)
+            .gPadding(12.dp)
+    ) {
+        Text(
+            t("Prochaines échéances", "Upcoming tasks"),
+            style = TextStyle(color = white, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+        )
+        GSpacer(GlanceModifier.gHeight(8.dp))
+        if (tasks.isEmpty()) {
+            Text(
+                t("Aucune tâche à venir", "No upcoming tasks"),
+                style = TextStyle(color = grey, fontSize = 13.sp)
+            )
+        } else {
+            GLazyColumn {
+                gItems(tasks) { task ->
+                    val overdue = task.due < now
+                    GColumn(
+                        GlanceModifier
+                            .gFillMaxWidth()
+                            .gPadding(vertical = 4.dp)
+                    ) {
+                        Text(
+                            task.text,
+                            style = TextStyle(color = white, fontSize = 13.sp),
+                            maxLines = 2
+                        )
+                        Text(
+                            formatDue(task.due) + " · " + task.list,
+                            style = TextStyle(
+                                color = if (overdue) bordeaux else grey,
+                                fontSize = 11.sp
+                            ),
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -557,7 +675,13 @@ fun App(
     // Le bouton Retour d'Android revient à l'accueil au lieu de fermer l'app
     BackHandler(enabled = openListName != null) { openListName = null }
 
-    fun persist() = store.save(lists)
+    fun persist() {
+        store.save(lists)
+        // Rafraîchit le widget d'accueil (s'il est posé sur l'écran)
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching { TasksWidget.updateAll(context) }
+        }
+    }
 
     val current = openListName?.let { name -> lists.find { it.name == name } }
 
@@ -962,11 +1086,11 @@ fun HomeScreen(
             text = {
                 Column {
                     Text(
-                        "Tic-task 1.1 — 6 novembre 2026",
+                        "Tic-task 1.2 — 10 novembre 2026",
                         style = MaterialTheme.typography.titleMedium
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(t("Date de sortie : 6 novembre 2026", "Release date: November 6, 2026"))
+                    Text(t("Date de sortie : 10 novembre 2026", "Release date: November 10, 2026"))
                     Text(
                         t(
                             "Application de listes de tâches 100 % locale : " +
@@ -1290,7 +1414,6 @@ fun ListScreen(
     var deleteItem by remember { mutableStateOf<TaskItem?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var showSortDialog by remember { mutableStateOf(false) }
-    var addNonce by remember { mutableStateOf(0) }
     val listState = rememberLazyListState()
 
     // Ouvre le dialogue d'édition quand on vient d'une notification
@@ -1405,26 +1528,16 @@ fun ListScreen(
         }
     }
 
-    // « Entrée » dans le champ texte : crée l'élément et rouvre immédiatement
-    // un dialogue vierge (key(addNonce) force la réinitialisation des champs)
     if (showAddDialog) {
-        key(addNonce) {
-            EntryDialog(
-                initialNotifLead = list.defaultNotifLead,
-                exists = { name -> list.items.any { it.text == name } },
-                onConfirm = { text, due, notif, lead, desc ->
-                    if (text.isNotBlank()) onAddItem(text, due, notif, lead, desc)
-                    showAddDialog = false
-                },
-                onConfirmNew = { text, due, notif, lead, desc ->
-                    if (text.isNotBlank()) {
-                        onAddItem(text, due, notif, lead, desc)
-                        addNonce++
-                    }
-                },
-                onDismiss = { showAddDialog = false }
-            )
-        }
+        EntryDialog(
+            initialNotifLead = list.defaultNotifLead,
+            exists = { name -> list.items.any { it.text == name } },
+            onConfirm = { text, due, notif, lead, desc ->
+                if (text.isNotBlank()) onAddItem(text, due, notif, lead, desc)
+                showAddDialog = false
+            },
+            onDismiss = { showAddDialog = false }
+        )
     }
 
     editItem?.let { item ->
@@ -1580,6 +1693,9 @@ fun NameDialog(
                 onValueChange = { text = it },
                 label = { Text(label) },
                 singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    capitalization = KeyboardCapitalization.Sentences
+                ),
                 isError = duplicate,
                 supportingText = {
                     if (duplicate) {
@@ -1722,7 +1838,6 @@ fun EntryDialog(
     initialNotifLead: Int = 15,
     exists: (String) -> Boolean = { false },
     onConfirm: (String, Long?, Boolean, Int, String) -> Unit,
-    onConfirmNew: ((String, Long?, Boolean, Int, String) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     var text by remember { mutableStateOf(initialText) }
@@ -1773,7 +1888,7 @@ fun EntryDialog(
     val textFocus = remember { FocusRequester() }
     val descFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
-        if (onConfirmNew != null) textFocus.requestFocus()
+        if (initialText.isEmpty()) textFocus.requestFocus()
     }
 
     AlertDialog(
@@ -1802,23 +1917,25 @@ fun EntryDialog(
                     },
                     modifier = Modifier.focusRequester(textFocus),
                     // « Entrée » ici : passe au champ description
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    keyboardOptions = KeyboardOptions(
+                        imeAction = ImeAction.Next,
+                        capitalization = KeyboardCapitalization.Sentences
+                    ),
                     keyboardActions = KeyboardActions(onNext = { descFocus.requestFocus() })
                 )
+                // Description : édition multi-lignes (« Entrée » = nouvelle ligne)
                 OutlinedTextField(
                     value = desc,
                     onValueChange = { desc = it },
                     label = { Text(t("Description (optionnel)", "Description (optional)")) },
-                    singleLine = true,
+                    minLines = 3,
+                    maxLines = 5,
                     modifier = Modifier
                         .padding(top = 8.dp)
                         .focusRequester(descFocus),
-                    // « Entrée » ici : crée l'élément et rouvre un formulaire vierge
-                    // (uniquement en mode création)
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = {
-                        if (onConfirmNew != null) confirmValue(onConfirmNew)
-                    })
+                    keyboardOptions = KeyboardOptions(
+                        capitalization = KeyboardCapitalization.Sentences
+                    )
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
