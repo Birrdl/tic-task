@@ -1551,11 +1551,11 @@ fun HomeScreen(
             text = {
                 Column {
                     Text(
-                        "Tic-task 1.2 — 10 novembre 2026",
+                        "Tic-task 1.2 — 12 novembre 2026",
                         style = MaterialTheme.typography.titleMedium
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(t("Date de sortie : 10 novembre 2026", "Release date: November 10, 2026"))
+                    Text(t("Date de sortie : 12 novembre 2026", "Release date: November 12, 2026"))
                     Text(
                         t(
                             "Application de listes de tâches 100 % locale : " +
