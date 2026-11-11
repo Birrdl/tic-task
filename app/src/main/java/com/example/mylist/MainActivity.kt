@@ -9,10 +9,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.appwidget.AppWidgetManager
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.content.res.Configuration
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -78,10 +80,25 @@ import androidx.glance.appwidget.GlanceAppWidgetReceiver
 import androidx.glance.appwidget.SizeMode
 import androidx.glance.appwidget.cornerRadius
 import androidx.glance.appwidget.provideContent
+import androidx.glance.action.clickable as gClickable
+import androidx.glance.appwidget.action.actionStartActivity as gStartActivity
+import androidx.glance.appwidget.action.ActionCallback
+import androidx.glance.appwidget.CheckBox as GCheckBox
+import androidx.glance.action.ActionParameters
+import androidx.glance.action.actionParametersOf
+import androidx.glance.appwidget.action.actionRunCallback as gRunCallback
+import androidx.glance.layout.Row as GRow
+import androidx.glance.currentState
+import androidx.glance.state.PreferencesGlanceStateDefinition
+import androidx.glance.appwidget.GlanceAppWidgetManager
+import androidx.glance.appwidget.state.updateAppWidgetState
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.glance.background
-import androidx.glance.text.FontWeight
-import androidx.glance.text.Text
-import androidx.glance.text.TextStyle
+import androidx.glance.text.FontWeight as GFontWeight
+import androidx.glance.text.Text as GText
+import androidx.glance.text.TextStyle as GTextStyle
 import androidx.glance.unit.ColorProvider
 // Alias : Glance utilise les mêmes noms que Compose (Column, LazyColumn…)
 import androidx.glance.appwidget.lazy.LazyColumn as GLazyColumn
@@ -114,6 +131,23 @@ fun t(fr: String, en: String) = if (EN) en else fr
 
 // Page GitHub de signalement de bug (remplace TON_PSEUDO et myList par ton dépôt)
 const val GITHUB_ISSUES_URL = "https://github.com/Birrdl/tic-task/issues/new"
+
+// Palette bordeaux de l'app (partagée entre l'écran principal, les notifications
+// et le menu de choix de liste du widget)
+fun themeColors(dark: Boolean): ColorScheme =
+    if (dark) darkColorScheme(
+        primary = Color(0xFFFFB2C0),
+        onPrimary = Color(0xFF5E0E2B),
+        secondary = Color(0xFFE6BDC4),
+        primaryContainer = Color(0xFF7A2743),
+        onPrimaryContainer = Color(0xFFFFD9DE)
+    ) else lightColorScheme(
+        primary = Color(0xFF8E1F3F),
+        onPrimary = Color.White,
+        secondary = Color(0xFF77565D),
+        primaryContainer = Color(0xFFFFD9DE),
+        onPrimaryContainer = Color(0xFF3F0019)
+    )
 
 // Formate un délai en minutes vers « X j », « X h » ou « X min »
 fun formatLead(minutes: Int): String = when {
@@ -408,7 +442,21 @@ class MarkDoneReceiver : BroadcastReceiver() {
             store.save(lists)
             // Rafraîchit le widget d'accueil (coche faite depuis une notification)
             CoroutineScope(Dispatchers.IO).launch {
-                runCatching { TasksWidget.updateAll(context) }
+                runCatching {
+                    val manager = GlanceAppWidgetManager(context)
+                    manager.getGlanceIds(ListsWidget.javaClass).forEach { id ->
+                        updateAppWidgetState(context, id) { prefs ->
+                            prefs[widgetRefreshKey] = System.currentTimeMillis()
+                        }
+                    }
+                    manager.getGlanceIds(TasksWidget.javaClass).forEach { id ->
+                        updateAppWidgetState(context, id) { prefs ->
+                            prefs[widgetRefreshKey] = System.currentTimeMillis()
+                        }
+                    }
+                    TasksWidget.updateAll(context)
+                    ListsWidget.updateAll(context)
+                }
             }
             // Prévient l'app si elle est ouverte, pour rafraîchir l'affichage
             // immédiatement (sinon l'état en mémoire écraserait la coche)
@@ -426,83 +474,466 @@ class MarkDoneReceiver : BroadcastReceiver() {
 
 class TasksWidgetReceiver : GlanceAppWidgetReceiver() {
     override val glanceAppWidget: GlanceAppWidget = TasksWidget
+    override fun onEnabled(context: Context) { super.onEnabled(context); watchThemeChanges(context) }
+    override fun onUpdate(
+        context: Context,
+        appWidgetManager: AppWidgetManager,
+        appWidgetIds: IntArray
+    ) {
+        super.onUpdate(context, appWidgetManager, appWidgetIds)
+        watchThemeChanges(context)
+    }
+}
+
+// Les widgets lisent le thème (clair/sombre) à la composition, mais Android
+// ne prévient pas les widgets quand il change : on s'abonne dynamiquement à
+// ACTION_CONFIGURATION_CHANGED (impossible dans le manifest, cf. doc Android)
+// pour recharger les widgets dès que le téléphone bascule clair/sombre.
+// NB : ce récepteur vit tant que le processus de l'app est en vie ; si le
+// système l'a tué, les widgets se remettront au prochain refresh (30 min).
+private var themeWatcher: BroadcastReceiver? = null
+fun watchThemeChanges(context: Context) {
+    if (themeWatcher != null) return
+    themeWatcher = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            val appContext = ctx?.applicationContext ?: return
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    TasksWidget.updateAll(appContext)
+                    ListsWidget.updateAll(appContext)
+                }
+            }
+        }
+    }
+    context.registerReceiver(themeWatcher, IntentFilter(Intent.ACTION_CONFIGURATION_CHANGED))
 }
 
 data class WidgetTask(val list: String, val text: String, val due: Long)
 
 object TasksWidget : GlanceAppWidget() {
-    // Le contenu est recalculé quand la hauteur du widget change (3×3 → 6×8)
+    // État Glance observé par la composition : le compteur de rafraîchissement
+    // (cochage depuis le widget ou l'app) force la recomposition immédiate
+    override val stateDefinition = PreferencesGlanceStateDefinition
+
+    // Le contenu s'adapte à la taille du widget (défaut 3×3, étirable
+    // au maximum autorisé par le lanceur d'applications)
     override val sizeMode = SizeMode.Responsive(
         setOf(
             DpSize(180.dp, 180.dp),  // 3×3 cellules
             DpSize(180.dp, 280.dp),
             DpSize(180.dp, 400.dp),
-            DpSize(180.dp, 530.dp)   // 6×8 cellules
+            DpSize(180.dp, 530.dp),
+            DpSize(320.dp, 280.dp),
+            DpSize(320.dp, 400.dp),
+            DpSize(320.dp, 530.dp)
         )
     )
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
-        // Tâches non cochées avec une échéance, toutes listes confondues, triées par échéance
-        val tasks = runCatching { LocalStore(context).load() }
-            .getOrDefault(mutableListOf())
-            .flatMap { l ->
-                l.items.filter { !it.checked && it.due != null }
-                    .map { WidgetTask(l.name, it.text, it.due!!) }
-            }
-            .sortedBy { it.due }
-            .take(20)
-        provideContent { WidgetContent(tasks) }
+        provideContent {
+            // Les données sont relues ICI (dans la composition), pour que
+            // chaque recomposition reparte du fichier à jour. La lecture du
+            // compteur fait que la composition observe l'état Glance.
+            val prefs = currentState<Preferences>()
+            val refresh = prefs[widgetRefreshKey] ?: 0L
+            // Tâches non cochées avec une échéance, toutes listes confondues,
+            // triées par échéance (une tâche cochée disparaît donc du widget)
+            val tasks = if (refresh >= 0)  // (lit la clé pour l'observer)
+                runCatching { LocalStore(context).load() }
+                    .getOrDefault(mutableListOf())
+                    .flatMap { l ->
+                        l.items.filter { !it.checked && it.due != null }
+                            .map { WidgetTask(l.name, it.text, it.due!!) }
+                    }
+                    .sortedBy { it.due }
+                    .take(20)
+            else mutableListOf()
+            WidgetContent(tasks, context)
+        }
     }
 }
 
 @Composable
-fun WidgetContent(tasks: List<WidgetTask>) {
-    val anthracite = ColorProvider(Color(0xFF26282D))
-    val white = ColorProvider(Color(0xFFF2F2F2))
-    val grey = ColorProvider(Color(0xFFB8BCC2))
-    val bordeaux = ColorProvider(Color(0xFFD4776F))
+fun WidgetContent(tasks: List<WidgetTask>, context: Context) {
+    // Suit le thème du téléphone (clair ou sombre), relu à chaque recomposition ;
+    // le « veilleur de thème » ci-dessous force un re-render quand il change
+    val dark = (context.resources.configuration.uiMode
+            and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    val bg = ColorProvider(if (dark) Color(0xFF26282D) else Color(0xFFFFFFFF))
+    val fg = ColorProvider(if (dark) Color(0xFFF2F2F2) else Color(0xFF26282D))
+    val sub = ColorProvider(if (dark) Color(0xFFB8BCC2) else Color(0xFF5C6066))
+    val accent = ColorProvider(if (dark) Color(0xFFD4776F) else Color(0xFF9E2B25))
     val now = System.currentTimeMillis()
     GColumn(
         modifier = GlanceModifier
             .gFillMaxSize()
-            .background(anthracite)
+            .background(bg)
             .cornerRadius(16.dp)
             .gPadding(12.dp)
     ) {
-        Text(
+        GText(
             t("Prochaines échéances", "Upcoming tasks"),
-            style = TextStyle(color = white, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            style = GTextStyle(color = fg, fontWeight = GFontWeight.Bold, fontSize = 15.sp)
         )
         GSpacer(GlanceModifier.gHeight(8.dp))
         if (tasks.isEmpty()) {
-            Text(
+            GText(
                 t("Aucune tâche à venir", "No upcoming tasks"),
-                style = TextStyle(color = grey, fontSize = 13.sp)
+                style = GTextStyle(color = sub, fontSize = 13.sp)
             )
         } else {
             GLazyColumn {
                 gItems(tasks) { task ->
                     val overdue = task.due < now
-                    GColumn(
+                    // Tap sur une tâche → ouvre l'app directement sur son
+                    // dialogue d'édition (même mécanisme que les notifications)
+                    val openIntent = Intent(context, MainActivity::class.java).apply {
+                        // Action unique par tâche : sans ça, Android considère
+                        // tous les PendingIntents identiques (les extras ne
+                        // comptent pas) et tout le monde ouvrirait la même tâche
+                        action = "com.example.mylist.WIDGET_OPEN|" +
+                                task.list + "|" + task.text
+                        putExtra("editList", task.list)
+                        putExtra("editItem", task.text)
+                        putExtra("openDialog", true)
+                    }
+                    // Une ligne = case à cocher + textes (le cochage utilise
+                    // la même action que le widget « liste » ; la tâche cochée
+                    // disparaît du widget puisqu'il ne montre que les non cochées)
+                    GRow(
                         GlanceModifier
                             .gFillMaxWidth()
                             .gPadding(vertical = 4.dp)
                     ) {
-                        Text(
-                            task.text,
-                            style = TextStyle(color = white, fontSize = 13.sp),
-                            maxLines = 2
+                        GCheckBox(
+                            checked = false,
+                            onCheckedChange = gRunCallback<ToggleTaskAction>(
+                                actionParametersOf(
+                                    widgetListNameKey to task.list,
+                                    widgetItemTextKey to task.text
+                                )
+                            )
                         )
-                        Text(
-                            formatDue(task.due) + " · " + task.list,
-                            style = TextStyle(
-                                color = if (overdue) bordeaux else grey,
-                                fontSize = 11.sp
-                            ),
-                            maxLines = 1
-                        )
+                        GColumn(
+                            GlanceModifier
+                                .defaultWeight()
+                                .gClickable(onClick = gStartActivity(openIntent))
+                        ) {
+                            GText(
+                                task.text,
+                                style = GTextStyle(color = fg, fontSize = 13.sp),
+                                maxLines = 2
+                            )
+                            GText(
+                                formatDue(task.due) + " · " + task.list,
+                                style = GTextStyle(
+                                    color = if (overdue) accent else sub,
+                                    fontSize = 11.sp
+                                ),
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+// ---------- Widget « Liste » : contenu d'une liste au choix, avec ajout rapide ----------
+
+class ListsWidgetReceiver : GlanceAppWidgetReceiver() {
+    override val glanceAppWidget: GlanceAppWidget = ListsWidget
+    override fun onEnabled(context: Context) { super.onEnabled(context); watchThemeChanges(context) }
+    override fun onUpdate(
+        context: Context,
+        appWidgetManager: AppWidgetManager,
+        appWidgetIds: IntArray
+    ) {
+        super.onUpdate(context, appWidgetManager, appWidgetIds)
+        watchThemeChanges(context)
+    }
+}
+
+object ListsWidget : GlanceAppWidget() {
+    // Le choix de liste est stocké dans l'état Glance : le widget observe
+    // cet état et se rafraîchit immédiatement quand il change
+    override val stateDefinition = PreferencesGlanceStateDefinition
+
+    // Même tailles que le premier widget
+    override val sizeMode = SizeMode.Responsive(
+        setOf(
+            DpSize(180.dp, 180.dp),
+            DpSize(180.dp, 280.dp),
+            DpSize(180.dp, 400.dp),
+            DpSize(180.dp, 530.dp),
+            DpSize(320.dp, 280.dp),
+            DpSize(320.dp, 400.dp),
+            DpSize(320.dp, 530.dp)
+        )
+    )
+
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        provideContent {
+            // État observé : (re)composition automatique dès que le choix
+            // ou le compteur de rafraîchissement change. Les données sont
+            // relues ICI (dans la composition), pas dans provideGlance,
+            // sinon un cochage depuis le widget réafficherait l'ancien
+            // snapshot pendant que la session Glance est active (~45 s).
+            val prefs = currentState<Preferences>()
+            val chosen = prefs[widgetListKey]
+            val refresh = prefs[widgetRefreshKey] ?: 0L
+            val lists = if (refresh >= 0)  // (lit la clé pour l'observer)
+                runCatching { LocalStore(context).load() }.getOrDefault(mutableListOf())
+            else mutableListOf()
+            val list = lists.find { it.name == chosen } ?: lists.firstOrNull()
+            ListsContent(context, list)
+        }
+    }
+}
+
+// Clé de l'état Glance : nom de la liste affichée par le widget « Liste »
+val widgetListKey = stringPreferencesKey("widgetList")
+
+// Compteur incrémenté à chaque modification (cochage depuis le widget,
+// changement dans l'app…) pour forcer la recomposition immédiate du widget
+val widgetRefreshKey = longPreferencesKey("widgetRefresh")
+
+// Paramètres passés à l'action « cocher/décocher » du widget « Liste »
+val widgetListNameKey = ActionParameters.Key<String>("list")
+val widgetItemTextKey = ActionParameters.Key<String>("item")
+
+// Coche/décoche une tâche depuis le widget, sans ouvrir l'app
+class ToggleTaskAction : ActionCallback {
+    override suspend fun onAction(
+        context: Context,
+        glanceId: GlanceId,
+        parameters: ActionParameters
+    ) {
+        val listName = parameters[widgetListNameKey] ?: return
+        val itemText = parameters[widgetItemTextKey] ?: return
+        val store = LocalStore(context)
+        val lists = store.load()
+        val list = lists.find { it.name == listName } ?: return
+        val idx = list.items.indexOfFirst { it.text == itemText }
+        if (idx < 0) return
+        val toggled = list.items[idx].copy(checked = !list.items[idx].checked)
+        list.items[idx] = toggled
+        store.save(lists)
+        // Gère la notification associée comme le fait l'app
+        if (toggled.notif && toggled.due != null) {
+            if (toggled.checked) cancelNotification(context, listName, itemText)
+            else scheduleNotification(context, listName, toggled)
+        }
+        // Incrémente le compteur dans l'état Glance : la composition observe
+        // cette clé, donc la case affichée suit immédiatement le changement,
+        // même pendant que la session Glance est active (updateAll y est ignoré)
+        runCatching {
+            updateAppWidgetState(context, glanceId) { prefs ->
+                prefs[widgetRefreshKey] = System.currentTimeMillis()
+            }
+        }
+        runCatching {
+            TasksWidget.updateAll(context)
+            ListsWidget.updateAll(context)
+        }
+    }
+}
+
+@Composable
+fun ListsContent(context: Context, list: TaskList?) {
+    // Suit le thème du téléphone (clair ou sombre), relu à chaque recomposition ;
+    // le « veilleur de thème » ci-dessous force un re-render quand il change
+    val dark = (context.resources.configuration.uiMode
+            and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    val bg = ColorProvider(if (dark) Color(0xFF26282D) else Color(0xFFFFFFFF))
+    val fg = ColorProvider(if (dark) Color(0xFFF2F2F2) else Color(0xFF26282D))
+    val sub = ColorProvider(if (dark) Color(0xFFB8BCC2) else Color(0xFF5C6066))
+    GColumn(
+        modifier = GlanceModifier
+            .gFillMaxSize()
+            .background(bg)
+            .cornerRadius(16.dp)
+            .gPadding(12.dp)
+    ) {
+        if (list == null) {
+            GText(
+                t("Aucune liste", "No list yet"),
+                style = GTextStyle(color = sub, fontSize = 13.sp)
+            )
+        } else {
+            // En-tête : nom de la liste (tap = menu de choix) + « + » (ajout rapide)
+            val pickIntent = Intent(context, ListPickerActivity::class.java)
+            val addIntent = Intent(context, MainActivity::class.java).apply {
+                action = "com.example.mylist.WIDGET_ADD|" + list.name
+                putExtra("openList", list.name)
+                putExtra("newTask", true)
+            }
+            GRow(
+                GlanceModifier
+                    .gFillMaxWidth()
+                    .gPadding(bottom = 6.dp)
+            ) {
+                GText(
+                    list.name + "  ▼",
+                    style = GTextStyle(
+                        color = fg,
+                        fontWeight = GFontWeight.Bold,
+                        fontSize = 15.sp
+                    ),
+                    modifier = GlanceModifier
+                        .defaultWeight()
+                        .gClickable(onClick = gStartActivity(pickIntent)),
+                    maxLines = 1
+                )
+                GText(
+                    "＋",
+                    style = GTextStyle(
+                        color = fg,
+                        fontWeight = GFontWeight.Bold,
+                        fontSize = 16.sp
+                    ),
+                    modifier = GlanceModifier
+                        .gPadding(start = 8.dp)
+                        .gClickable(onClick = gStartActivity(addIntent))
+                )
+            }
+            if (list.items.isEmpty()) {
+                GText(
+                    t("Liste vide", "Empty list"),
+                    style = GTextStyle(color = sub, fontSize = 13.sp)
+                )
+            } else {
+                // Éléments : non cochées en haut, cochées en bas (comme dans
+                // l'app), chaque groupe dans l'ordre configuré de la liste
+                val sorted =
+                    sortForList(list.items.filter { !it.checked }, list.sortMode, list.sortDesc) +
+                            sortForList(list.items.filter { it.checked }, list.sortMode, list.sortDesc)
+                // IMPORTANT : Glance envoie TOUS les éléments du GLazyColumn
+                // au lanceur (pas de « lazy » réel : chaque ligne = RemoteViews
+                // + 2 PendingIntents), et Android plafonne le transfert à ~1 Mo
+                // (TransactionTooLargeException au-delà). On plafonne donc à 12
+                // lignes affichées + un pied « + N autres ».
+                val maxShown = 12
+                val shown = sorted.take(maxShown)
+                val hidden = sorted.size - shown.size
+                GLazyColumn {
+                    gItems(shown) { item ->
+                        val openIntent = Intent(context, MainActivity::class.java).apply {
+                            action = "com.example.mylist.WIDGET_OPEN|" +
+                                    list.name + "|" + item.text
+                            putExtra("editList", list.name)
+                            putExtra("editItem", item.text)
+                            putExtra("openDialog", true)
+                        }
+                        // Une ligne = une case à cocher + le texte de la tâche
+                        GRow(
+                            GlanceModifier
+                                .gFillMaxWidth()
+                                .gPadding(vertical = 2.dp)
+                        ) {
+                            GCheckBox(
+                                checked = item.checked,
+                                onCheckedChange = gRunCallback<ToggleTaskAction>(
+                                    actionParametersOf(
+                                        widgetListNameKey to list.name,
+                                        widgetItemTextKey to item.text
+                                    )
+                                )
+                            )
+                            GText(
+                                item.text +
+                                        (item.due?.let { " · " + formatDue(it) } ?: ""),
+                                style = GTextStyle(
+                                    color = if (item.checked) sub else fg,
+                                    fontSize = 13.sp
+                                ),
+                                modifier = GlanceModifier
+                                    .defaultWeight()
+                                    .gClickable(onClick = gStartActivity(openIntent))
+                                    .gPadding(start = 4.dp, top = 2.dp),
+                                maxLines = 2
+                            )
+                        }
+                    }
+                    // Pied « + N autres » : DANS la liste, comme dernier
+                    // élément (un texte posé APRÈS le GLazyColumn ne serait
+                    // jamais visible : la liste occupe toute la hauteur)
+                    if (hidden > 0) {
+                        item {
+                            GText(
+                                "+" + hidden + t(" autres…", " more…"),
+                                style = GTextStyle(color = sub, fontSize = 12.sp),
+                                modifier = GlanceModifier.gPadding(top = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Menu de choix de liste (dialogue Compose au thème de l'app, par-dessus
+// l'écran d'accueil). Le choix est écrit dans l'état Glance du widget.
+class ListPickerActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val store = LocalStore(this)
+        val names = store.load().map { it.name }
+        if (names.isEmpty()) {
+            finish()
+            return
+        }
+        // Thème du menu = celui de l'app (clair/sombre/auto) ; le mode
+        // « auto » se lit dans la configuration du système (pas de @Composable ici)
+        val dark = when (store.getTheme()) {
+            1 -> false
+            2 -> true
+            else -> (resources.configuration.uiMode
+                    and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        }
+        fun pick(name: String) {
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    val manager = GlanceAppWidgetManager(this@ListPickerActivity)
+                    val ids = manager.getGlanceIds(ListsWidget.javaClass)
+                    for (id in ids) {
+                        updateAppWidgetState(this@ListPickerActivity, id) { prefs ->
+                            prefs[widgetListKey] = name
+                        }
+                    }
+                    ListsWidget.updateAll(this@ListPickerActivity)
+                }
+            }
+            finish()
+        }
+        setContent {
+            MaterialTheme(colorScheme = themeColors(dark)) {
+                AlertDialog(
+                    onDismissRequest = { finish() },
+                    title = { Text(t("Liste affichée", "Shown list")) },
+                    text = {
+                        Column {
+                            names.forEach { name ->
+                                Text(
+                                    name,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { pick(name) }
+                                        .padding(14.dp),
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = { finish() }) {
+                            Text(t("Annuler", "Cancel"))
+                        }
+                    }
+                )
             }
         }
     }
@@ -540,10 +971,14 @@ class MainActivity : ComponentActivity() {
     // Demande reçue d'une notification : (liste, élément, ouvrir le dialogue ?)
     private val pendingEdit = mutableStateOf<Triple<String, String, Boolean>?>(null)
 
+    // Demande reçue du bouton « + » du widget « Liste » : liste où créer
+    private val pendingAdd = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val store = LocalStore(this)
         handleEditIntent(intent)
+        handleAddIntent(intent)
         val themeMode = mutableStateOf(store.getTheme())
         setContent {
             // Demande l'autorisation d'afficher des notifications (Android 13+)
@@ -566,19 +1001,8 @@ class MainActivity : ComponentActivity() {
                 2 -> true
                 else -> isSystemInDarkTheme()
             }
-            val colors = if (dark) darkColorScheme(
-                primary = Color(0xFFFFB2C0),
-                onPrimary = Color(0xFF5E0E2B),
-                secondary = Color(0xFFE6BDC4),
-                primaryContainer = Color(0xFF7A2743),
-                onPrimaryContainer = Color(0xFFFFD9DE)
-            ) else lightColorScheme(
-                primary = Color(0xFF8E1F3F),
-                onPrimary = Color.White,
-                secondary = Color(0xFF77565D),
-                primaryContainer = Color(0xFFFFD9DE),
-                onPrimaryContainer = Color(0xFF3F0019)
-            )
+            // Palette partagée (thème clair/sombre/automatique)
+            val colors = themeColors(dark)
             // Icônes de la barre de statut (heure, batterie) : noires en thème
             // clair, blanches en thème sombre
             LaunchedEffect(dark) {
@@ -586,7 +1010,7 @@ class MainActivity : ComponentActivity() {
                     .isAppearanceLightStatusBars = !dark
             }
             MaterialTheme(colorScheme = colors) {
-                App(store, pendingEdit, themeMode) { mode ->
+                App(store, pendingEdit, pendingAdd, themeMode) { mode ->
                     themeMode.value = mode
                     store.setTheme(mode)
                 }
@@ -597,6 +1021,14 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleEditIntent(intent)
+        handleAddIntent(intent)
+    }
+
+    // « + » du widget « Liste » : ouvre l'app sur le dialogue de création d'élément
+    private fun handleAddIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("newTask", false) == true) {
+            intent.getStringExtra("openList")?.let { pendingAdd.value = it }
+        }
     }
 
     private fun handleEditIntent(intent: Intent?) {
@@ -615,6 +1047,7 @@ class MainActivity : ComponentActivity() {
 fun App(
     store: LocalStore,
     pendingEdit: MutableState<Triple<String, String, Boolean>?>,
+    pendingAdd: MutableState<String?>,
     themeMode: MutableState<Int>,
     onThemeChange: (Int) -> Unit
 ) {
@@ -625,6 +1058,7 @@ fun App(
     var showCopyDataDialog by remember { mutableStateOf(false) }
     var editRequest by remember { mutableStateOf<String?>(null) }
     var scrollRequest by remember { mutableStateOf<String?>(null) }
+    var addRequest by remember { mutableStateOf<String?>(null) }
     var tileMode by remember { mutableStateOf(store.getTile()) }
 
     // Recharge les données quand l'app revient au premier plan
@@ -672,14 +1106,41 @@ fun App(
         }
     }
 
+    // « + » du widget « Liste » : ouvre la liste sur le dialogue de création
+    LaunchedEffect(pendingAdd.value) {
+        pendingAdd.value?.let { listName ->
+            openListName = listName
+            addRequest = listName
+            pendingAdd.value = null
+        }
+    }
+
     // Le bouton Retour d'Android revient à l'accueil au lieu de fermer l'app
     BackHandler(enabled = openListName != null) { openListName = null }
 
     fun persist() {
         store.save(lists)
-        // Rafraîchit le widget d'accueil (s'il est posé sur l'écran)
+        // Rafraîchit les widgets d'accueil (s'ils sont posés sur l'écran).
+        // Le compteur d'état Glance est incrémenté pour que le widget « liste »
+        // se recompose immédiatement même si sa session est encore active.
         CoroutineScope(Dispatchers.IO).launch {
-            runCatching { TasksWidget.updateAll(context) }
+            runCatching {
+                val manager = GlanceAppWidgetManager(context)
+                // Incrémente le compteur d'état Glance des DEUX widgets :
+                // recomposition immédiate même si une session est active
+                manager.getGlanceIds(ListsWidget.javaClass).forEach { id ->
+                    updateAppWidgetState(context, id) { prefs ->
+                        prefs[widgetRefreshKey] = System.currentTimeMillis()
+                    }
+                }
+                manager.getGlanceIds(TasksWidget.javaClass).forEach { id ->
+                    updateAppWidgetState(context, id) { prefs ->
+                        prefs[widgetRefreshKey] = System.currentTimeMillis()
+                    }
+                }
+                TasksWidget.updateAll(context)
+                ListsWidget.updateAll(context)
+            }
         }
     }
 
@@ -764,6 +1225,8 @@ fun App(
             },
             editRequest = editRequest,
             onEditConsumed = { editRequest = null },
+            addRequest = addRequest,
+            onAddConsumed = { addRequest = null },
             scrollRequest = scrollRequest,
             onScrollConsumed = { scrollRequest = null }
         )
@@ -1028,6 +1491,7 @@ fun HomeScreen(
                             onOpen = onOpen,
                             onDeleteList = onDeleteList,
                             onRenameList = onRenameList,
+                            nameExists = { n -> lists.any { it.name == n } },
                             onDragStart = {
                                 draggingKey = list.name
                                 dragOffset = 0f
@@ -1059,6 +1523,7 @@ fun HomeScreen(
                             onOpen = onOpen,
                             onDeleteList = onDeleteList,
                             onRenameList = onRenameList,
+                            nameExists = { n -> lists.any { it.name == n } },
                             onDragStart = {
                                 draggingKey = list.name
                                 dragOffset = 0f
@@ -1187,6 +1652,9 @@ fun ListCard(
     onOpen: (String) -> Unit,
     onDeleteList: (String) -> Unit,
     onRenameList: (String, String) -> Unit,
+    // Un nom est-il déjà pris par une AUTRE liste ? (pour le dialogue de
+    // renommage : le nom actuel de cette liste reste toujours autorisé)
+    nameExists: (String) -> Boolean,
     onDragStart: () -> Unit,
     onDrag: (Float) -> Unit,
     onDragEnd: () -> Unit
@@ -1306,7 +1774,9 @@ fun ListCard(
             title = t("Renommer la liste", "Rename list"),
             label = t("Nom de la liste", "List name"),
             initial = list.name,
-            exists = { newName -> newName != list.name },
+            // Doublon uniquement si le nouveau nom est différent du nom
+            // actuel ET déjà pris par une autre liste
+            exists = { newName -> newName != list.name && nameExists(newName) },
             onConfirm = { newName ->
                 onRenameList(list.name, newName.trim())
                 showRename = false
@@ -1406,6 +1876,8 @@ fun ListScreen(
     onSortChange: (Int) -> Unit,
     editRequest: String? = null,
     onEditConsumed: () -> Unit = {},
+    addRequest: String? = null,
+    onAddConsumed: () -> Unit = {},
     scrollRequest: String? = null,
     onScrollConsumed: () -> Unit = {}
 ) {
@@ -1421,6 +1893,14 @@ fun ListScreen(
         if (editRequest != null) {
             list.items.find { it.text == editRequest }?.let { editItem = it }
             onEditConsumed()
+        }
+    }
+
+    // Ouvre le dialogue de création quand on vient du « + » du widget « Liste »
+    LaunchedEffect(addRequest) {
+        if (addRequest == list.name) {
+            showAddDialog = true
+            onAddConsumed()
         }
     }
 
@@ -1820,6 +2300,14 @@ fun formatDue(millis: Long): String {
     }
 }
 
+// Date seule (bouton « calendrier » de l'échéance) ex. « 12 nov. 2026 »
+fun formatDueDate(millis: Long): String =
+    SimpleDateFormat("d MMM yyyy", Locale.getDefault()).format(Date(millis))
+
+// Heure seule (bouton « horloge » de l'échéance) ex. « 10:00 »
+fun formatDueTime(millis: Long): String =
+    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(millis))
+
 fun defaultDueToday(): Long =
     Calendar.getInstance().apply {
         set(Calendar.HOUR_OF_DAY, 10)
@@ -1864,7 +2352,6 @@ fun EntryDialog(
     }
     var showDatePicker by remember { mutableStateOf(false) }
     var showTimePicker by remember { mutableStateOf(false) }
-    var pendingDate by remember { mutableStateOf(0L) }
     val duplicate = text.isNotBlank() &&
             text.trim() != initialText.trim() &&
             exists(text.trim())
@@ -1953,8 +2440,23 @@ fun EntryDialog(
                     Text(t("Échéance", "Due date"))
                 }
                 if (hasDue) {
-                    OutlinedButton(onClick = { showDatePicker = true }) {
-                        Text("📅 " + formatDue(due ?: defaultDueToday()))
+                    // Deux boutons côte à côte : date (calendrier) à gauche,
+                    // heure (sélecteur à deux cadrans) à droite
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { showDatePicker = true },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("📅 " + formatDueDate(due ?: defaultDueToday()))
+                        }
+                        OutlinedButton(
+                            onClick = { showTimePicker = true },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("🕒 " + formatDueTime(due ?: defaultDueToday()))
+                        }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
@@ -2009,7 +2511,7 @@ fun EntryDialog(
         }
     )
 
-    // Étape 1 : choix de la date
+    // Bouton « date » : calendrier seul ; l'heure actuelle de l'échéance est conservée
     if (showDatePicker) {
         val dateState = rememberDatePickerState(
             initialSelectedDateMillis = due ?: defaultDueToday()
@@ -2018,10 +2520,22 @@ fun EntryDialog(
             onDismissRequest = { showDatePicker = false },
             confirmButton = {
                 TextButton(onClick = {
-                    pendingDate = dateState.selectedDateMillis ?: System.currentTimeMillis()
+                    val utcMillis = dateState.selectedDateMillis ?: defaultDueToday()
+                    val utc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+                        timeInMillis = utcMillis
+                    }
+                    // Garde l'heure déjà choisie (ou celle par défaut), change la date
+                    val cal = Calendar.getInstance().apply {
+                        timeInMillis = due ?: defaultDueToday()
+                        set(
+                            utc.get(Calendar.YEAR), utc.get(Calendar.MONTH),
+                            utc.get(Calendar.DAY_OF_MONTH),
+                            get(Calendar.HOUR_OF_DAY), get(Calendar.MINUTE), 0
+                        )
+                    }
+                    due = cal.timeInMillis
                     showDatePicker = false
-                    showTimePicker = true
-                }) { Text(t("Suivant", "Next")) }
+                }) { Text("OK") }
             },
             dismissButton = {
                 TextButton(onClick = { showDatePicker = false }) { Text(t("Annuler", "Cancel")) }
@@ -2031,7 +2545,7 @@ fun EntryDialog(
         }
     }
 
-    // Étape 2 : choix de l'heure
+    // Bouton « heure » : sélecteur à deux cadrans (cercles) ; la date est conservée
     if (showTimePicker) {
         val initCal = Calendar.getInstance().apply {
             timeInMillis = due ?: defaultDueToday()
@@ -2043,16 +2557,15 @@ fun EntryDialog(
         AlertDialog(
             onDismissRequest = { showTimePicker = false },
             title = { Text(t("Heure", "Time")) },
-            text = { TimeInput(state = timeState) },
+            // TimePicker = cadrans circulaires (au lieu de TimeInput = clavier)
+            text = { TimePicker(state = timeState) },
             confirmButton = {
                 TextButton(onClick = {
-                    val utc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
-                        timeInMillis = pendingDate
-                    }
                     val cal = Calendar.getInstance().apply {
+                        timeInMillis = due ?: defaultDueToday()
                         set(
-                            utc.get(Calendar.YEAR), utc.get(Calendar.MONTH),
-                            utc.get(Calendar.DAY_OF_MONTH),
+                            get(Calendar.YEAR), get(Calendar.MONTH),
+                            get(Calendar.DAY_OF_MONTH),
                             timeState.hour, timeState.minute, 0
                         )
                     }

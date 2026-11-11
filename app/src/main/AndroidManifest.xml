@@ -23,7 +23,7 @@
         <receiver
             android:name=".TasksWidgetReceiver"
             android:exported="false"
-            android:label="Tic-task">
+            android:label="Tic-task — échéances">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
@@ -31,5 +31,21 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/tasks_widget_info" />
         </receiver>
+        <receiver
+            android:name=".ListsWidgetReceiver"
+            android:exported="false"
+            android:label="Tic-task — liste">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/lists_widget_info" />
+        </receiver>
+        <activity
+            android:name=".ListPickerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.Light.Dialog.NoActionBar"
+            android:noHistory="true" />
     </application>
 </manifest>
